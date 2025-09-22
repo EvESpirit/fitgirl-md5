@@ -1,183 +1,503 @@
 #!/usr/bin/env python3
 import hashlib
 import os
-import argparse
-from concurrent.futures import ThreadPoolExecutor, as_completed
-import time
 import sys
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
-try:
-    from tqdm import tqdm
-    TQDM_AVAILABLE = True
-except ImportError:
-    TQDM_AVAILABLE = False
+# PyQt6 Imports
+from PyQt6.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QPushButton, QLineEdit, QTableWidget, QTableWidgetItem,
+    QProgressBar, QLabel, QFileDialog, QStatusBar, QHeaderView, QStackedWidget
+)
+from PyQt6.QtCore import QObject, QThread, pyqtSignal, Qt
+from PyQt6.QtGui import QIcon, QColor, QFont, QBrush
 
-FIXED_MANIFEST_FILENAME = "fitgirl-bins.md5"
+MANIFEST_FILENAME = "fitgirl-bins.md5"
+MD5_SUBFOLDER = "MD5"
 
-def calculate_md5_for_file(filepath, block_size=65536):
-    """Calculates the MD5 hash of a file."""
+# Dark Theme Stylesheet
+DARK_STYLESHEET = """
+QWidget {
+    background-color: #2b2b2b;
+    color: #f0f0f0;
+    font-family: Segoe UI, sans-serif;
+    font-size: 10pt;
+}
+QMainWindow {
+    border: 1px solid #1e1e1e;
+}
+QTableWidget {
+    gridline-color: #444;
+    background-color: #3c3c3c;
+    border: 1px solid #555;
+    border-radius: 4px;
+}
+QTableWidget::item {
+    padding-left: 5px;
+    border-bottom: 1px solid #444;
+}
+QHeaderView::section {
+    background-color: #444;
+    padding: 4px;
+    border: 1px solid #555;
+    font-weight: bold;
+}
+QPushButton {
+    background-color: #007acc;
+    color: #ffffff;
+    border: none;
+    padding: 8px 16px;
+    border-radius: 4px;
+    font-weight: bold;
+}
+QPushButton:hover {
+    background-color: #008ae6;
+}
+QPushButton:pressed {
+    background-color: #006bb3;
+}
+QPushButton:disabled {
+    background-color: #404040;
+    color: #888;
+}
+QPushButton#quitButton {
+    background-color: #c62828;
+}
+QPushButton#quitButton:hover {
+    background-color: #e53935;
+}
+QPushButton#quitButton:pressed {
+    background-color: #b71c1c;
+}
+QLineEdit {
+    background-color: #3c3c3c;
+    border: 1px solid #555;
+    border-radius: 4px;
+    padding: 4px;
+}
+QProgressBar {
+    border: 1px solid #555;
+    border-radius: 4px;
+    text-align: center;
+    color: #f0f0f0;
+    height: 18px;
+}
+QProgressBar::chunk {
+    background-color: #007acc;
+    border-radius: 3px;
+    margin: 1px;
+}
+QStatusBar {
+    font-size: 9pt;
+}
+QLabel#titleLabel {
+    font-size: 14pt;
+    font-weight: bold;
+    padding-bottom: 5px;
+}
+"""
+
+
+# Core Verification Logic
+def calculateMd5(filepath, blockSize=655360, progressCallback=None, isRunningCheck=None):
+    """
+    Calculates the MD5 hash of a file with progress reporting and cancellation support.
+    """
     md5 = hashlib.md5()
     try:
+        totalSize = os.path.getsize(filepath)
+        bytesRead = 0
+        lastPercentage = -1
         with open(filepath, 'rb') as f:
             while True:
-                data = f.read(block_size)
+                if isRunningCheck and not isRunningCheck():
+                    return "CANCELLED"
+                data = f.read(blockSize)
                 if not data:
                     break
                 md5.update(data)
+                bytesRead += len(data)
+                if progressCallback and totalSize > 0:
+                    # Only emit the signal if the percentage value has changed.
+                    currentPercentage = int((bytesRead / totalSize) * 100)
+                    if currentPercentage > lastPercentage:
+                        progressCallback(currentPercentage)
+                        lastPercentage = currentPercentage
+
+        # Ensure the progress bar always hits 100% on completion.
+        if progressCallback and lastPercentage < 100:
+            progressCallback(100)
+
         return md5.hexdigest()
     except FileNotFoundError:
         return None
-    except IOError as e:
-        print(f"IOError reading {filepath}: {e}")
+    except IOError:
         return "IO_ERROR"
 
-def process_file_entry(filepath_to_check, expected_md5, manifest_file_path_for_logging):
+
+class VerificationController(QObject):
     """
-    Worker function to check a single file.
-    Returns a tuple: (status_code, message, calculated_hash_or_None)
-    status_code: "OK", "FAILED", "MISSING", "ERROR"
+    Manages the multithreaded file verification process.
     """
-    if not os.path.exists(filepath_to_check):
-        return "MISSING", f"MISSING: {os.path.relpath(filepath_to_check, os.path.dirname(manifest_file_path_for_logging))}", None
+    fileProgress = pyqtSignal(int, int)
+    fileFinished = pyqtSignal(int, str, QColor)
+    allFinished = pyqtSignal(dict)
 
-    actual_md5 = calculate_md5_for_file(filepath_to_check)
+    def __init__(self, tasks):
+        super().__init__()
+        self.tasks = tasks
+        self.isRunning = True
+        self.threadCount = os.cpu_count() or 1
+        self.executor = None
 
-    relative_path_for_display = os.path.relpath(filepath_to_check, os.path.dirname(manifest_file_path_for_logging))
+    def run(self):
+        """
+        Runs verification tasks in a thread pool.
+        """
+        summary = {"ok": 0, "failed": 0, "missing": 0, "error": 0, "total": len(self.tasks), "time": 0.0}
+        startTime = time.perf_counter()
 
-    if actual_md5 is None: # Should have been caught by os.path.exists, but defensive
-        return "MISSING", f"MISSING: {relative_path_for_display} (could not open after initial check)", None
-    if actual_md5 == "IO_ERROR":
-        return "ERROR", f"ERROR reading: {relative_path_for_display}", None
+        self.executor = ThreadPoolExecutor(max_workers=self.threadCount)
+        futures = {self.executor.submit(self.processFile, i, task): i for i, task in enumerate(self.tasks)}
 
-    if actual_md5.lower() == expected_md5.lower():
-        return "OK", f"OK: {relative_path_for_display}", actual_md5
-    else:
-        return "FAILED", f"FAILED: {relative_path_for_display}\n  Expected: {expected_md5}\n  Actual:   {actual_md5}", actual_md5
+        try:
+            for future in as_completed(futures):
+                if not self.isRunning:
+                    break
+                try:
+                    statusCode = future.result()
+                    if statusCode:
+                        summary[statusCode.lower()] += 1
+                except Exception:
+                    # Exceptions may occur if a future is cancelled.
+                    pass
+        finally:
+            if self.isRunning:
+                self.executor.shutdown(wait=True)
+
+        endTime = time.perf_counter()
+        summary["time"] = endTime - startTime
+        if self.isRunning:
+            self.allFinished.emit(summary)
+
+    def processFile(self, index, taskDetails):
+        """
+        Processes a single file, checks existence and calculates its hash.
+        """
+        if not self.isRunning:
+            return "CANCELLED"
+
+        filepath, expectedHash, _ = taskDetails
+        if not os.path.exists(filepath):
+            self.fileFinished.emit(index, "MISSING", QColor("#ff5555"))
+            return "MISSING"
+
+        progressCallback = lambda p: self.fileProgress.emit(index, p) if self.isRunning else None
+        isRunningCheck = lambda: self.isRunning
+        actualMd5 = calculateMd5(filepath, progressCallback=progressCallback, isRunningCheck=isRunningCheck)
+
+        if not self.isRunning or actualMd5 == "CANCELLED":
+            return "CANCELLED"
+        if actualMd5 is None:
+            self.fileFinished.emit(index, "MISSING", QColor("#ff5555"))
+            return "MISSING"
+        if actualMd5 == "IO_ERROR":
+            self.fileFinished.emit(index, "I/O ERROR", QColor("#ff9900"))
+            return "ERROR"
+
+        if actualMd5.lower() == expectedHash.lower():
+            self.fileFinished.emit(index, "OK", QColor("#55ff55"))
+            return "OK"
+        else:
+            self.fileFinished.emit(index, "FAILED", QColor("#ff5555"))
+            return "FAILED"
+
+    def stop(self):
+        """
+        Non-blocking shutdown of the thread pool.
+        """
+        self.isRunning = False
+        if self.executor:
+            # Tell the executor to shut down without waiting for tasks to finish.
+            if sys.version_info >= (3, 9):
+                self.executor.shutdown(wait=False, cancel_futures=True)
+            else:
+                self.executor.shutdown(wait=False)
+
+
+# GUI
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("FitGirl Repack Verifier")
+        self.initialSize = (1200, 600)
+        self.setGeometry(100, 100, self.initialSize[0], self.initialSize[1])
+        self.setMinimumSize(700, 400)
+        self.setWindowIcon(QIcon(self.createAppIcon()))
+
+        self.workerThread = None
+        self.controller = None
+        self.tasks = []
+
+        self.initializeUi()
+
+    def createAppIcon(self):
+        """I was bored bored. Fuck you! *unfiles your icon*"""
+        from PyQt6.QtGui import QPixmap, QPainter
+        pixmap = QPixmap(64, 64)
+        pixmap.fill(Qt.GlobalColor.transparent)
+        p = QPainter(pixmap)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setBrush(QColor("#007acc"))
+        p.setPen(Qt.PenStyle.NoPen)
+        p.drawEllipse(2, 2, 60, 60)
+        p.setBrush(QColor("#ffffff"))
+        p.setFont(QFont("Arial", 32, QFont.Weight.Bold))
+        p.drawText(pixmap.rect(), Qt.AlignmentFlag.AlignCenter, "✓")
+        p.end()
+        return pixmap
+
+    def initializeUi(self):
+        """Sets up the main user interface and layout."""
+        centralWidget = QWidget()
+        self.setCentralWidget(centralWidget)
+        mainLayout = QVBoxLayout(centralWidget)
+        mainLayout.setSpacing(10)
+        mainLayout.setContentsMargins(15, 15, 15, 15)
+
+        self.titleLabel = QLabel("FitGirl Repack Verifier")
+        self.titleLabel.setObjectName("titleLabel")
+        self.titleLabel.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        mainLayout.addWidget(self.titleLabel)
+
+        folderLayout = QHBoxLayout()
+        self.folderPathEdit = QLineEdit()
+        self.folderPathEdit.setPlaceholderText("Select repack folder")
+        self.folderPathEdit.setReadOnly(True)
+        self.browseButton = QPushButton("Browse...")
+        self.browseButton.clicked.connect(self.selectFolder)
+        folderLayout.addWidget(QLabel("Repack Folder:"))
+        folderLayout.addWidget(self.folderPathEdit)
+        folderLayout.addWidget(self.browseButton)
+        mainLayout.addLayout(folderLayout)
+
+        self.fileTable = QTableWidget()
+        self.fileTable.setColumnCount(3)
+        self.fileTable.setHorizontalHeaderLabels(["File", "Progress", "Status"])
+        self.fileTable.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self.fileTable.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
+        self.fileTable.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)
+        self.fileTable.setColumnWidth(1, 150)
+        self.fileTable.setColumnWidth(2, 100)
+        self.fileTable.verticalHeader().hide()
+        self.fileTable.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.fileTable.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        mainLayout.addWidget(self.fileTable)
+
+        self.buttonStack = QStackedWidget()
+        self.buttonStack.setFixedHeight(40)
+        self.startButton = QPushButton("Start Verification")
+        self.startButton.clicked.connect(self.startVerification)
+        self.startButton.setFixedHeight(40)
+        self.startButton.setEnabled(False)
+        self.quitButton = QPushButton("Quit")
+        self.quitButton.setObjectName("quitButton")
+        self.quitButton.clicked.connect(self.close)
+        self.quitButton.setFixedHeight(40)
+        self.buttonStack.addWidget(self.startButton)
+        self.buttonStack.addWidget(self.quitButton)
+        mainLayout.addWidget(self.buttonStack)
+
+        self.setStatusBar(QStatusBar(self))
+        threadCountLabel = QLabel(f"Threads: {os.cpu_count() or 1}")
+        self.statusBar().addPermanentWidget(threadCountLabel)
+        self.statusBar().showMessage("Ready. Select a folder to begin.")
+
+    def selectFolder(self):
+        selectedFolder = QFileDialog.getExistingDirectory(self, "Select Repack Folder")
+        if not selectedFolder:
+            return
+
+        self.folderPathEdit.setText(selectedFolder)
+        md5Dir = os.path.join(selectedFolder, MD5_SUBFOLDER)
+        manifestPath = os.path.join(md5Dir, MANIFEST_FILENAME)
+
+        if not os.path.isdir(md5Dir) or not os.path.isfile(manifestPath):
+            self.statusBar().showMessage(f"Error: Required folder/file structure not found.")
+            self.clearFileList()
+            self.adjustWindowSize()
+            return
+
+        self.statusBar().showMessage("Manifest found. Ready to verify.")
+        self.populateFileList(manifestPath, selectedFolder)
+
+    def clearFileList(self):
+        """Resets the file list and internal task state."""
+        self.startButton.setEnabled(False)
+        self.tasks.clear()
+        self.fileTable.setRowCount(0)
+
+    def populateFileList(self, manifestPath, repackRootFolder):
+        """Reads the manifest file and populates the UI table with tasks."""
+        self.clearFileList()
+        try:
+            with open(manifestPath, 'r', encoding='utf-8') as f:
+                lines = [ln.strip() for ln in f if ln.strip() and not ln.strip().startswith(';')]
+        except Exception as e:
+            self.statusBar().showMessage(f"Error reading manifest: {e}")
+            self.adjustWindowSize()
+            return
+
+        self.fileTable.setRowCount(len(lines))
+        for i, line in enumerate(lines):
+            parts = line.split('*', 1)
+            if len(parts) != 2:
+                continue
+
+            expectedHash = parts[0].strip()
+            relativePathCleaned = parts[1].strip().lstrip('.\\/')
+            absolutePathToCheck = os.path.join(repackRootFolder, relativePathCleaned)
+            self.tasks.append((absolutePathToCheck, expectedHash, relativePathCleaned))
+
+            itemFile = QTableWidgetItem(relativePathCleaned)
+            self.fileTable.setItem(i, 0, itemFile)
+
+            progressBar = QProgressBar()
+            progressBar.setValue(0)
+            progressBar.setTextVisible(False)
+            self.fileTable.setCellWidget(i, 1, progressBar)
+
+            itemStatus = QTableWidgetItem("Pending")
+            itemStatus.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.fileTable.setItem(i, 2, itemStatus)
+
+        if self.tasks:
+            self.startButton.setEnabled(True)
+            self.buttonStack.setCurrentWidget(self.startButton)
+
+        self.adjustWindowSize()
+
+    def adjustWindowSize(self):
+        """Adjusts the main window height based on the number of files."""
+        MAX_ROWS_FOR_STRETCH = 20
+        numRows = self.fileTable.rowCount()
+
+        if numRows == 0:
+            self.resize(*self.initialSize)
+            return
+
+        headerHeight = self.fileTable.horizontalHeader().height()
+        rowHeight = self.fileTable.rowHeight(0) if numRows > 0 else 25
+        frameHeight = self.fileTable.frameWidth() * 2
+
+        otherWidgetsHeight = (self.titleLabel.height() +
+                              self.folderPathEdit.parent().sizeHint().height() +
+                              self.buttonStack.height() +
+                              self.statusBar().height())
+
+        mainLayout = self.centralWidget().layout()
+        layoutMargins = mainLayout.contentsMargins()
+        otherWidgetsHeight += layoutMargins.top() + layoutMargins.bottom()
+        otherWidgetsHeight += mainLayout.spacing() * 3
+
+        rowsToDisplay = min(numRows, MAX_ROWS_FOR_STRETCH)
+        targetTableHeight = headerHeight + (rowsToDisplay * rowHeight) + frameHeight
+
+        totalHeight = targetTableHeight + otherWidgetsHeight
+        self.resize(self.initialSize[0], totalHeight)
+
+    def startVerification(self):
+        """Initializes and starts the background verification thread."""
+        if not self.tasks:
+            return
+
+        self.setControlsEnabled(False)
+        self.buttonStack.setCurrentWidget(self.quitButton)
+        self.statusBar().showMessage("Verification in progress...")
+
+        self.workerThread = QThread()
+        self.controller = VerificationController(self.tasks)
+        self.controller.moveToThread(self.workerThread)
+
+        self.workerThread.started.connect(self.controller.run)
+        self.controller.allFinished.connect(self.finalizeVerification)
+        self.controller.fileProgress.connect(self.updateFileProgress)
+        self.controller.fileFinished.connect(self.updateFileStatus)
+
+        # Ensure a clean slate for connections.
+        try:
+            self.workerThread.finished.disconnect()
+        except TypeError:
+            pass  # No connections to disconnect.
+
+        # Handle thread cleanup.
+        self.controller.allFinished.connect(self.workerThread.quit)
+        self.controller.allFinished.connect(self.controller.deleteLater)
+        self.workerThread.finished.connect(self.workerThread.deleteLater)
+
+        self.workerThread.start()
+
+    def updateFileProgress(self, index, percentage):
+        """Updates a specific progress bar."""
+        progressBar = self.fileTable.cellWidget(index, 1)
+        if isinstance(progressBar, QProgressBar):
+            progressBar.setValue(percentage)
+
+    def updateFileStatus(self, index, status, color):
+        """Updates a files final status in the table."""
+        self.fileTable.removeCellWidget(index, 1)
+
+        statusItem = self.fileTable.item(index, 2)
+        statusItem.setText(status)
+        statusItem.setForeground(QBrush(color))
+        statusItem.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
+
+    def finalizeVerification(self, summary):
+        """Handles the completion of the entire verification process."""
+        ok = summary.get('ok', 0)
+        issues = summary.get('failed', 0) + summary.get('missing', 0) + summary.get('error', 0)
+        if issues == 0:
+            msg = f"All {ok} files verified successfully! Time: {summary['time']:.2f}s"
+        else:
+            msg = f"Verification complete with {issues} issue(s). Time: {summary['time']:.2f}s"
+
+        self.statusBar().showMessage(msg)
+        self.setControlsEnabled(True)
+        self.workerThread = None
+
+    def setControlsEnabled(self, enabled):
+        """Enables or disables UI controls during verification."""
+        self.browseButton.setEnabled(enabled)
+        self.startButton.setEnabled(False if not enabled else bool(self.tasks))
+        if enabled and self.tasks:
+            self.buttonStack.setCurrentWidget(self.startButton)
+        else:
+            self.buttonStack.setCurrentWidget(self.quitButton)
+
+    def closeEvent(self, event):
+        """Handles the window close event."""
+        if self.workerThread and self.workerThread.isRunning():
+            self.statusBar().showMessage("Stopping verification and exiting...")
+            # Request the controller to stop all background hash calculations.
+            if self.controller:
+                self.controller.stop()
+            # Signal the QThread to terminate its event loop.
+            self.workerThread.quit()
+            # Wait for the thread to finish cleanly before closing the window.
+            self.workerThread.wait()
+        event.accept()
+
 
 def main():
-    parser = argparse.ArgumentParser(description=f"Multithreaded MD5 file checker. Expects '{FIXED_MANIFEST_FILENAME}' in its own directory.")
-    parser.add_argument(
-        "-t", "--threads",
-        type=int,
-        default=os.cpu_count() or 1,
-        help="Number of worker threads to use."
-    )
-    args = parser.parse_args()
+    app = QApplication(sys.argv)
+    app.setStyle("Fusion")
+    app.setStyleSheet(DARK_STYLESHEET)
+    window = MainWindow()
+    window.show()
+    sys.exit(app.exec())
 
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    manifest_file_path = os.path.join(script_dir, FIXED_MANIFEST_FILENAME)
-
-    if not os.path.isfile(manifest_file_path):
-        print(f"Error: Manifest file '{FIXED_MANIFEST_FILENAME}' not found in the script's directory:")
-        print(f"       {script_dir}")
-        print(f"Please ensure '{FIXED_MANIFEST_FILENAME}' is present alongside the script.")
-        sys.exit(1)
-
-    tasks = []
-    manifest_dir = script_dir
-
-    print(f"Using manifest file: {manifest_file_path}")
-    print(f"Base directory for files (relative to manifest): {manifest_dir}")
-    print(f"Using {args.threads} worker threads.\n")
-
-    try:
-        with open(manifest_file_path, 'r', encoding='utf-8') as f:
-            for line_num, line in enumerate(f, 1):
-                line = line.strip()
-                if not line or line.startswith(';'):
-                    continue
-
-                parts = line.split('*', 1)
-                if len(parts) != 2:
-                    print(f"Warning: Skipping malformed line {line_num} in manifest: {line}")
-                    continue
-
-                expected_hash = parts[0].strip()
-                relative_path_from_manifest_entry = parts[1].strip()
-
-                absolute_file_path_to_check = os.path.abspath(os.path.join(manifest_dir, relative_path_from_manifest_entry))
-                tasks.append((absolute_file_path_to_check, expected_hash, manifest_file_path))
-
-    except Exception as e:
-        print(f"Error reading manifest file {manifest_file_path}: {e}")
-        sys.exit(1)
-
-    if not tasks:
-        print(f"No files to check found in {FIXED_MANIFEST_FILENAME}.")
-        return
-
-    results_ok = []
-    results_failed = []
-    results_missing = []
-    results_error = []
-
-    start_time = time.perf_counter()
-
-    with ThreadPoolExecutor(max_workers=args.threads) as executor:
-        future_to_task = {
-            executor.submit(process_file_entry, task_path, task_hash, manifest_path_log): (task_path, task_hash)
-            for task_path, task_hash, manifest_path_log in tasks
-        }
-
-        iterable_futures = as_completed(future_to_task)
-        if TQDM_AVAILABLE:
-            iterable_futures = tqdm(iterable_futures, total=len(tasks), desc="Checking files", unit="file")
-
-        for future in iterable_futures:
-            original_filepath, original_hash = future_to_task[future]
-            try:
-                status, message, _ = future.result()
-                if status == "OK":
-                    results_ok.append(message)
-                    if not TQDM_AVAILABLE: print(message)
-                elif status == "FAILED":
-                    results_failed.append(message)
-                    print(message)
-                elif status == "MISSING":
-                    results_missing.append(message)
-                    print(message)
-                elif status == "ERROR":
-                    results_error.append(message)
-                    print(message)
-
-            except Exception as exc:
-                err_msg = f"ERROR processing {os.path.relpath(original_filepath, manifest_dir)}: {exc}"
-                results_error.append(err_msg)
-                print(err_msg)
-
-    end_time = time.perf_counter()
-    total_time = end_time - start_time
-
-    print("\n--- Verification Summary ---")
-    if TQDM_AVAILABLE and results_ok:
-        for ok_msg in results_ok:
-            print(ok_msg)
-
-    if results_failed:
-        print(f"\n--- {len(results_failed)} FAILED CHECKS ---")
-        for fail_msg in results_failed:
-            print(fail_msg)
-    if results_missing:
-        print(f"\n--- {len(results_missing)} MISSING FILES ---")
-        for miss_msg in results_missing:
-            print(miss_msg)
-    if results_error:
-        print(f"\n--- {len(results_error)} ERRORS DURING PROCESSING ---")
-        for err_msg in results_error:
-            print(err_msg)
-
-    print(f"\nChecked {len(tasks)} files from {FIXED_MANIFEST_FILENAME}.")
-    print(f"  OK:      {len(results_ok)}")
-    print(f"  Failed:  {len(results_failed)}")
-    print(f"  Missing: {len(results_missing)}")
-    print(f"  Errors:  {len(results_error)}")
-    print(f"Total time: {total_time:.2f} seconds.")
-
-    if not results_failed and not results_missing and not results_error:
-        print("\nAll files verified successfully!")
-    else:
-        print("\nVerification complete. Some issues were found.")
-        sys.exit(1)
 
 if __name__ == "__main__":
     main()
