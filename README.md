@@ -9,7 +9,7 @@ Download the md5.exe file from this repository's releases.
 
 >*(Optional) Verify with a free tool like File Hasher or using PowerShell's inbuilt ```Get-FileHash md5.exe``` capabilities.*
 
-```SHA256 for the 1.0 release: B7145FEEE5A24FD5A923391DBB3BF341CE4720C1A7779BF47CCBB0588CDA29FA```
+```SHA256 for the 1.0 release: 3D847A91ABC398A512E1636AE804DD90A097C900364C5A65270351F5AB69DC18```
 
 Run it and point it towards your repack's parent directory.
 
