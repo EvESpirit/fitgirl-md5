@@ -4,7 +4,7 @@ A Python script designed to check fitgirl repacks much, much faster than the Qui
 
 
 
-###GUI Usage:
+### GUI Usage:
 Download the md5.exe file from this repository's releases.
 
 >*(Optional) Verify with a free tool like File Hasher or using PowerShell's inbuilt ```Get-FileHash md5.exe``` capabilities.*
@@ -16,7 +16,7 @@ Run it and point it towards your repack's parent directory.
 
 
 
-###Terminal usage:
+### Terminal usage:
 Download the md5.py file from this repository or copy it's source code.
 
 Open CMD or PowerShell in the folder where you put the script and run it with ```python md5.py```
