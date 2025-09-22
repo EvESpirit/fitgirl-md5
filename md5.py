@@ -99,12 +99,8 @@ QLabel#titleLabel {
 }
 """
 
-
 # Core Verification Logic
 def calculateMd5(filepath, blockSize=655360, progressCallback=None, isRunningCheck=None):
-    """
-    Calculates the MD5 hash of a file with progress reporting and cancellation support.
-    """
     md5 = hashlib.md5()
     try:
         totalSize = os.path.getsize(filepath)
@@ -120,13 +116,11 @@ def calculateMd5(filepath, blockSize=655360, progressCallback=None, isRunningChe
                 md5.update(data)
                 bytesRead += len(data)
                 if progressCallback and totalSize > 0:
-                    # Only emit the signal if the percentage value has changed.
                     currentPercentage = int((bytesRead / totalSize) * 100)
                     if currentPercentage > lastPercentage:
                         progressCallback(currentPercentage)
                         lastPercentage = currentPercentage
 
-        # Ensure the progress bar always hits 100% on completion.
         if progressCallback and lastPercentage < 100:
             progressCallback(100)
 
@@ -136,17 +130,16 @@ def calculateMd5(filepath, blockSize=655360, progressCallback=None, isRunningChe
     except IOError:
         return "IO_ERROR"
 
-
-class VerificationController(QObject):
+class VerificationThread(QThread):
     """
-    Manages the multithreaded file verification process.
+    Manages the verification process by subclassing QThread.
     """
     fileProgress = pyqtSignal(int, int)
     fileFinished = pyqtSignal(int, str, QColor)
     allFinished = pyqtSignal(dict)
 
-    def __init__(self, tasks):
-        super().__init__()
+    def __init__(self, tasks, parent=None):
+        super().__init__(parent)
         self.tasks = tasks
         self.isRunning = True
         self.threadCount = os.cpu_count() or 1
@@ -154,7 +147,7 @@ class VerificationController(QObject):
 
     def run(self):
         """
-        Runs verification tasks in a thread pool.
+        The main execution method for the thread.
         """
         summary = {"ok": 0, "failed": 0, "missing": 0, "error": 0, "total": len(self.tasks), "time": 0.0}
         startTime = time.perf_counter()
@@ -165,27 +158,22 @@ class VerificationController(QObject):
         try:
             for future in as_completed(futures):
                 if not self.isRunning:
+                    for f in futures:
+                        f.cancel()
                     break
                 try:
                     statusCode = future.result()
-                    if statusCode:
+                    if statusCode and statusCode != "CANCELLED":
                         summary[statusCode.lower()] += 1
                 except Exception:
-                    # Exceptions may occur if a future is cancelled.
                     pass
         finally:
-            if self.isRunning:
-                self.executor.shutdown(wait=True)
-
-        endTime = time.perf_counter()
-        summary["time"] = endTime - startTime
-        if self.isRunning:
+            self.executor.shutdown(wait=True)
+            endTime = time.perf_counter()
+            summary["time"] = endTime - startTime
             self.allFinished.emit(summary)
 
     def processFile(self, index, taskDetails):
-        """
-        Processes a single file, checks existence and calculates its hash.
-        """
         if not self.isRunning:
             return "CANCELLED"
 
@@ -215,17 +203,8 @@ class VerificationController(QObject):
             return "FAILED"
 
     def stop(self):
-        """
-        Non-blocking shutdown of the thread pool.
-        """
+        """Signals the verification process to stop."""
         self.isRunning = False
-        if self.executor:
-            # Tell the executor to shut down without waiting for tasks to finish.
-            if sys.version_info >= (3, 9):
-                self.executor.shutdown(wait=False, cancel_futures=True)
-            else:
-                self.executor.shutdown(wait=False)
-
 
 # GUI
 class MainWindow(QMainWindow):
@@ -238,13 +217,11 @@ class MainWindow(QMainWindow):
         self.setWindowIcon(QIcon(self.createAppIcon()))
 
         self.workerThread = None
-        self.controller = None
         self.tasks = []
 
         self.initializeUi()
 
     def createAppIcon(self):
-        """I was bored bored. Fuck you! *unfiles your icon*"""
         from PyQt6.QtGui import QPixmap, QPainter
         pixmap = QPixmap(64, 64)
         pixmap.fill(Qt.GlobalColor.transparent)
@@ -260,18 +237,15 @@ class MainWindow(QMainWindow):
         return pixmap
 
     def initializeUi(self):
-        """Sets up the main user interface and layout."""
         centralWidget = QWidget()
         self.setCentralWidget(centralWidget)
         mainLayout = QVBoxLayout(centralWidget)
         mainLayout.setSpacing(10)
         mainLayout.setContentsMargins(15, 15, 15, 15)
-
         self.titleLabel = QLabel("FitGirl Repack Verifier")
         self.titleLabel.setObjectName("titleLabel")
         self.titleLabel.setAlignment(Qt.AlignmentFlag.AlignCenter)
         mainLayout.addWidget(self.titleLabel)
-
         folderLayout = QHBoxLayout()
         self.folderPathEdit = QLineEdit()
         self.folderPathEdit.setPlaceholderText("Select repack folder")
@@ -282,7 +256,6 @@ class MainWindow(QMainWindow):
         folderLayout.addWidget(self.folderPathEdit)
         folderLayout.addWidget(self.browseButton)
         mainLayout.addLayout(folderLayout)
-
         self.fileTable = QTableWidget()
         self.fileTable.setColumnCount(3)
         self.fileTable.setHorizontalHeaderLabels(["File", "Progress", "Status"])
@@ -295,7 +268,6 @@ class MainWindow(QMainWindow):
         self.fileTable.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.fileTable.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         mainLayout.addWidget(self.fileTable)
-
         self.buttonStack = QStackedWidget()
         self.buttonStack.setFixedHeight(40)
         self.startButton = QPushButton("Start Verification")
@@ -309,7 +281,6 @@ class MainWindow(QMainWindow):
         self.buttonStack.addWidget(self.startButton)
         self.buttonStack.addWidget(self.quitButton)
         mainLayout.addWidget(self.buttonStack)
-
         self.setStatusBar(QStatusBar(self))
         threadCountLabel = QLabel(f"Threads: {os.cpu_count() or 1}")
         self.statusBar().addPermanentWidget(threadCountLabel)
@@ -319,28 +290,23 @@ class MainWindow(QMainWindow):
         selectedFolder = QFileDialog.getExistingDirectory(self, "Select Repack Folder")
         if not selectedFolder:
             return
-
         self.folderPathEdit.setText(selectedFolder)
         md5Dir = os.path.join(selectedFolder, MD5_SUBFOLDER)
         manifestPath = os.path.join(md5Dir, MANIFEST_FILENAME)
-
         if not os.path.isdir(md5Dir) or not os.path.isfile(manifestPath):
             self.statusBar().showMessage(f"Error: Required folder/file structure not found.")
             self.clearFileList()
             self.adjustWindowSize()
             return
-
         self.statusBar().showMessage("Manifest found. Ready to verify.")
         self.populateFileList(manifestPath, selectedFolder)
 
     def clearFileList(self):
-        """Resets the file list and internal task state."""
         self.startButton.setEnabled(False)
         self.tasks.clear()
         self.fileTable.setRowCount(0)
 
     def populateFileList(self, manifestPath, repackRootFolder):
-        """Reads the manifest file and populates the UI table with tasks."""
         self.clearFileList()
         try:
             with open(manifestPath, 'r', encoding='utf-8') as f:
@@ -349,62 +315,43 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(f"Error reading manifest: {e}")
             self.adjustWindowSize()
             return
-
         self.fileTable.setRowCount(len(lines))
         for i, line in enumerate(lines):
             parts = line.split('*', 1)
-            if len(parts) != 2:
-                continue
-
+            if len(parts) != 2: continue
             expectedHash = parts[0].strip()
             relativePathCleaned = parts[1].strip().lstrip('.\\/')
             absolutePathToCheck = os.path.join(repackRootFolder, relativePathCleaned)
             self.tasks.append((absolutePathToCheck, expectedHash, relativePathCleaned))
-
             itemFile = QTableWidgetItem(relativePathCleaned)
             self.fileTable.setItem(i, 0, itemFile)
-
             progressBar = QProgressBar()
             progressBar.setValue(0)
             progressBar.setTextVisible(False)
             self.fileTable.setCellWidget(i, 1, progressBar)
-
             itemStatus = QTableWidgetItem("Pending")
             itemStatus.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
             self.fileTable.setItem(i, 2, itemStatus)
-
         if self.tasks:
             self.startButton.setEnabled(True)
             self.buttonStack.setCurrentWidget(self.startButton)
-
         self.adjustWindowSize()
 
     def adjustWindowSize(self):
-        """Adjusts the main window height based on the number of files."""
         MAX_ROWS_FOR_STRETCH = 20
         numRows = self.fileTable.rowCount()
-
         if numRows == 0:
             self.resize(*self.initialSize)
             return
-
         headerHeight = self.fileTable.horizontalHeader().height()
         rowHeight = self.fileTable.rowHeight(0) if numRows > 0 else 25
         frameHeight = self.fileTable.frameWidth() * 2
-
-        otherWidgetsHeight = (self.titleLabel.height() +
-                              self.folderPathEdit.parent().sizeHint().height() +
-                              self.buttonStack.height() +
-                              self.statusBar().height())
-
+        otherWidgetsHeight = (self.titleLabel.height() + self.folderPathEdit.parent().sizeHint().height() + self.buttonStack.height() + self.statusBar().height())
         mainLayout = self.centralWidget().layout()
         layoutMargins = mainLayout.contentsMargins()
-        otherWidgetsHeight += layoutMargins.top() + layoutMargins.bottom()
-        otherWidgetsHeight += mainLayout.spacing() * 3
-
+        otherWidgetsHeight += layoutMargins.top() + layoutMargins.bottom() + mainLayout.spacing() * 3
         rowsToDisplay = min(numRows, MAX_ROWS_FOR_STRETCH)
         targetTableHeight = headerHeight + (rowsToDisplay * rowHeight) + frameHeight
-
         totalHeight = targetTableHeight + otherWidgetsHeight
         self.resize(self.initialSize[0], totalHeight)
 
@@ -416,79 +363,67 @@ class MainWindow(QMainWindow):
         self.setControlsEnabled(False)
         self.buttonStack.setCurrentWidget(self.quitButton)
         self.statusBar().showMessage("Verification in progress...")
+        
+        self.workerThread = VerificationThread(self.tasks)
 
-        self.workerThread = QThread()
-        self.controller = VerificationController(self.tasks)
-        self.controller.moveToThread(self.workerThread)
+        self.workerThread.fileProgress.connect(self.updateFileProgress)
+        self.workerThread.fileFinished.connect(self.updateFileStatus)
+        self.workerThread.allFinished.connect(self.finalizeVerification)
 
-        self.workerThread.started.connect(self.controller.run)
-        self.controller.allFinished.connect(self.finalizeVerification)
-        self.controller.fileProgress.connect(self.updateFileProgress)
-        self.controller.fileFinished.connect(self.updateFileStatus)
-
-        # Ensure a clean slate for connections.
-        try:
-            self.workerThread.finished.disconnect()
-        except TypeError:
-            pass  # No connections to disconnect.
-
-        # Handle thread cleanup.
-        self.controller.allFinished.connect(self.workerThread.quit)
-        self.controller.allFinished.connect(self.controller.deleteLater)
         self.workerThread.finished.connect(self.workerThread.deleteLater)
-
+        
         self.workerThread.start()
-
-    def updateFileProgress(self, index, percentage):
-        """Updates a specific progress bar."""
-        progressBar = self.fileTable.cellWidget(index, 1)
-        if isinstance(progressBar, QProgressBar):
-            progressBar.setValue(percentage)
-
-    def updateFileStatus(self, index, status, color):
-        """Updates a files final status in the table."""
-        self.fileTable.removeCellWidget(index, 1)
-
-        statusItem = self.fileTable.item(index, 2)
-        statusItem.setText(status)
-        statusItem.setForeground(QBrush(color))
-        statusItem.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
-
+    
     def finalizeVerification(self, summary):
         """Handles the completion of the entire verification process."""
         ok = summary.get('ok', 0)
         issues = summary.get('failed', 0) + summary.get('missing', 0) + summary.get('error', 0)
-        if issues == 0:
+        
+        # Check if cancellation was triggered
+        was_cancelled = self.workerThread and not self.workerThread.isRunning
+        
+        if was_cancelled:
+             msg = f"Verification cancelled. Time: {summary['time']:.2f}s"
+        elif issues == 0 and ok > 0:
             msg = f"All {ok} files verified successfully! Time: {summary['time']:.2f}s"
         else:
             msg = f"Verification complete with {issues} issue(s). Time: {summary['time']:.2f}s"
 
         self.statusBar().showMessage(msg)
         self.setControlsEnabled(True)
+
+        # The thread will be deleted later by the finished signal,
+        # so we just clear our reference to it.
         self.workerThread = None
 
+    def closeEvent(self, event):
+        """Handles the window close event."""
+        if self.workerThread and self.workerThread.isRunning():
+            self.statusBar().showMessage("Stopping verification and exiting...")
+            self.workerThread.stop()
+            # Wait for the thread's run() method to complete
+            self.workerThread.wait()
+        event.accept()
+
+    def updateFileProgress(self, index, percentage):
+        progressBar = self.fileTable.cellWidget(index, 1)
+        if isinstance(progressBar, QProgressBar):
+            progressBar.setValue(percentage)
+
+    def updateFileStatus(self, index, status, color):
+        self.fileTable.removeCellWidget(index, 1)
+        statusItem = self.fileTable.item(index, 2)
+        statusItem.setText(status)
+        statusItem.setForeground(QBrush(color))
+        statusItem.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
+
     def setControlsEnabled(self, enabled):
-        """Enables or disables UI controls during verification."""
         self.browseButton.setEnabled(enabled)
         self.startButton.setEnabled(False if not enabled else bool(self.tasks))
         if enabled and self.tasks:
             self.buttonStack.setCurrentWidget(self.startButton)
         else:
             self.buttonStack.setCurrentWidget(self.quitButton)
-
-    def closeEvent(self, event):
-        """Handles the window close event."""
-        if self.workerThread and self.workerThread.isRunning():
-            self.statusBar().showMessage("Stopping verification and exiting...")
-            # Request the controller to stop all background hash calculations.
-            if self.controller:
-                self.controller.stop()
-            # Signal the QThread to terminate its event loop.
-            self.workerThread.quit()
-            # Wait for the thread to finish cleanly before closing the window.
-            self.workerThread.wait()
-        event.accept()
-
 
 def main():
     app = QApplication(sys.argv)
@@ -497,7 +432,6 @@ def main():
     window = MainWindow()
     window.show()
     sys.exit(app.exec())
-
 
 if __name__ == "__main__":
     main()
