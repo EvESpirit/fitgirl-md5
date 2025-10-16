@@ -307,7 +307,7 @@ class MainWindow(QMainWindow):
 
         self.welcomeModeSelector = QComboBox()
         self.welcomeModeSelector.setFixedWidth(300)
-        self.welcomeModeSelector.addItem("--- Select Mode ---", userData=None)
+        self.welcomeModeSelector.addItem("Select Mode", userData=None)
         self.welcomeModeSelector.addItem(VerificationMode.REPACK.value, userData=VerificationMode.REPACK)
         self.welcomeModeSelector.addItem(VerificationMode.UNPACKED.value, userData=VerificationMode.UNPACKED)
         self.welcomeModeSelector.currentIndexChanged.connect(self._onWelcomeModeSelected)
@@ -460,7 +460,6 @@ class MainWindow(QMainWindow):
         return None, None
 
     def _parseManifest(self, manifestPath: str, rootFolder: str) -> Optional[List[FileTask]]:
-        """Reads a manifest file and returns a list of FileTask objects."""
         lines = []
         try:
             with open(manifestPath, 'r', encoding='utf-8') as f:
@@ -488,10 +487,7 @@ class MainWindow(QMainWindow):
             expectedHash = parts[0].strip()
             relativePath = parts[1].strip().replace('/', os.sep)
             
-            if self.verificationMode == VerificationMode.UNPACKED:
-                absolutePath = os.path.join(manifestDir, relativePath)
-            else:
-                absolutePath = os.path.join(rootFolder, relativePath)
+            absolutePath = os.path.join(manifestDir, relativePath)
             
             tasks.append(FileTask(
                 filepath=os.path.normpath(absolutePath),
