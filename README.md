@@ -7,11 +7,13 @@ A Python script designed to check fitgirl repacks much, much faster than the Qui
 ### GUI Usage:
 Download the md5.exe file from this repository's releases.
 
->*(Optional) Verify with a free tool like File Hasher or using PowerShell's inbuilt ```Get-FileHash md5.exe``` capabilities.*
+>*(Optional) Verify with a free tool like File Hasher (available on the Microsoft Store) or using PowerShell's inbuilt ```Get-FileHash md5.exe``` capabilities.*
 
 ```SHA256 for the 1.0 release: 3D847A91ABC398A512E1636AE804DD90A097C900364C5A65270351F5AB69DC18```
+```SHA256 for the 1.1 release: 48DEB2EE52F2D62BA9945A45BCAFA7472DAD487CC9BAF3DA699D265907831DA0```
 
 Run it and point it towards your repack's parent directory.
+
 
 
 
@@ -24,5 +26,5 @@ Open CMD or PowerShell in the folder where you put the script and run it with ``
 
 
 
-##This checker is faster than QuickSFV, but due to the inherent serial nature of MD5, it won't be any quicker if the only archives in the repack is very few but very large files.
+## This checker is faster than QuickSFV, but due to the inherent serial nature of MD5, it won't be any quicker if the only archives in the repack is very few but very large files.
 If FitGirl happens to read this, use BLAKE3 - it allows for paralellizing the hashing of single files. MD5 sucks.
